@@ -1,355 +1,338 @@
 #!/usr/bin/env python3
 """
-Sparse Parity Benchmark: Energy Efficiency Testbed for Learning Algorithms
-==========================================================================
+Sparse Parity Benchmark — Pure Python, No Dependencies
+=======================================================
 
-This script implements a baseline benchmark for evaluating the "energy cost"
-(optimization steps to perfect generalization) of neural network training
-algorithms on the (n, k)-sparse parity problem.
+The most atomic way to train a neural network on sparse parity.
+This file is the complete algorithm. Everything else is just efficiency.
 
-NO AUTODIFF. All gradients are computed by hand.
-Inspired by Karpathy's microGPT — everything is explicit.
+No torch. No numpy. No autograd. Just Python, math, and random.
+Inspired by Karpathy's microGPT.
 
-The Sparse Parity Problem:
-  Given x ∈ {-1,1}^n, the target is y = ∏_{i∈S} x_i where S is a hidden
-  subset of k indices. The network must discover S from data alone.
-
-Architecture:
-  x ∈ R^n  →  Linear(W1,b1)  →  ReLU  →  Linear(W2,b2)  →  scalar output f(x)
-  Loss: Hinge loss = max(0, 1 - f(x)·y)
-
-Usage:
-    python sparse_parity_benchmark.py
+Architecture: x ∈ {-1,1}^n → Linear(W1,b1) → ReLU → Linear(W2,b2) → scalar
+Loss:         Hinge loss = max(0, 1 - f(x)·y)
+Optimizer:    SGD with weight decay
 """
 
-import torch
-import numpy as np
+import math
+import random
 import time
+
+random.seed(42)
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-N_BITS = 3            # n: total input bits
-K_SPARSE = 3          # k: relevant bits (parity subset size)
-N_TRAIN = 20          # training samples
-N_TEST = 20           # test samples
-SEED = 42
+N_BITS    = 3       # total input bits
+K_SPARSE  = 3       # parity subset size
+N_TRAIN   = 20      # training samples
+N_TEST    = 20      # test samples
+HIDDEN    = 1000    # hidden layer width
+LR        = 0.5     # learning rate
+WD        = 0.01    # weight decay
+MAX_EPOCHS = 10     # 10 epochs × 20 samples = 200 steps
+LOG_EVERY  = 1      # log every N epochs
+PATIENCE   = 10
 
-HIDDEN_DIM = 1000     # hidden layer width
+# =============================================================================
+# MATRIX HELPERS — the "linear algebra library" in pure Python
+# =============================================================================
 
-LEARNING_RATE = 0.5
-WEIGHT_DECAY = 0.01   # L2 regularization — critical for grokking
-MAX_EPOCHS = 10       # 10 epochs × 20 samples = 200 optimizer steps
-LOG_INTERVAL = 1      # print every epoch
-PATIENCE = 10
+def zeros(rows, cols=None):
+    """Create a zero vector (if cols=None) or matrix."""
+    if cols is None:
+        return [0.0] * rows
+    return [[0.0] * cols for _ in range(rows)]
 
+def randn(rows, cols=None, std=1.0):
+    """Sample from N(0, std^2). Returns vector or matrix."""
+    if cols is None:
+        return [random.gauss(0, std) for _ in range(rows)]
+    return [[random.gauss(0, std) for _ in range(cols)] for _ in range(rows)]
+
+def matvec(M, v):
+    """Matrix-vector product: M @ v. M is (m, n), v is (n,) → (m,)."""
+    return [sum(M[i][j] * v[j] for j in range(len(v))) for i in range(len(M))]
+
+def vecmat(v, M):
+    """Vector-matrix product: v @ M. v is (m,), M is (m, n) → (n,)."""
+    n = len(M[0])
+    return [sum(v[i] * M[i][j] for i in range(len(v))) for j in range(n)]
+
+def outer(u, v):
+    """Outer product: u ⊗ v. u is (m,), v is (n,) → (m, n)."""
+    return [[u[i] * v[j] for j in range(len(v))] for i in range(len(u))]
+
+def dot(u, v):
+    """Dot product."""
+    return sum(a * b for a, b in zip(u, v))
+
+def norm(v):
+    """L2 norm of a vector."""
+    return math.sqrt(sum(x * x for x in v))
+
+def mat_norm(M):
+    """Frobenius norm of a matrix."""
+    return math.sqrt(sum(x * x for row in M for x in row))
 
 # =============================================================================
 # 1. DATA GENERATION
 # =============================================================================
 
-def create_datasets(n=N_BITS, k=K_SPARSE, n_train=N_TRAIN, n_test=N_TEST, seed=SEED):
-    """Create (n,k)-sparse parity train/test datasets."""
-    rng = np.random.default_rng(seed)
-
-    # Choose the hidden subset S
-    secret = np.sort(rng.choice(n, size=k, replace=False))
-    print(f"[DATA] Secret parity indices S = {secret.tolist()}")
-    print(f"[DATA] Problem: n={n}, k={k}, N_train={n_train}, N_test={n_test}")
+def create_datasets():
+    """Generate (n,k)-sparse parity train/test data."""
+    # Choose secret subset S
+    secret = sorted(random.sample(range(N_BITS), K_SPARSE))
+    print(f"[DATA] Secret parity indices S = {secret}")
+    print(f"[DATA] Problem: n={N_BITS}, k={K_SPARSE}, N_train={N_TRAIN}, N_test={N_TEST}")
 
     def make_data(num):
-        x = torch.from_numpy(rng.choice([-1, 1], size=(num, n)).astype(np.float32))
-        y = x[:, secret].prod(dim=1)
-        return x, y
+        xs, ys = [], []
+        for _ in range(num):
+            x = [random.choice([-1.0, 1.0]) for _ in range(N_BITS)]
+            y = 1.0
+            for idx in secret:
+                y *= x[idx]
+            xs.append(x)
+            ys.append(y)
+        return xs, ys
 
-    x_train, y_train = make_data(n_train)
-    x_test, y_test = make_data(n_test)
+    x_train, y_train = make_data(N_TRAIN)
+    x_test, y_test = make_data(N_TEST)
     return x_train, y_train, x_test, y_test, secret
 
+# =============================================================================
+# 2. MODEL: raw lists, Kaiming init
+# =============================================================================
+
+def init_params():
+    """Initialize 2-layer MLP parameters as plain Python lists."""
+    std1 = math.sqrt(2.0 / N_BITS)
+    std2 = math.sqrt(2.0 / HIDDEN)
+    W1 = randn(HIDDEN, N_BITS, std=std1)    # (hidden, n)
+    b1 = zeros(HIDDEN)                       # (hidden,)
+    W2 = randn(1, HIDDEN, std=std2)          # (1, hidden)
+    b2 = zeros(1)                            # (1,)
+    total = HIDDEN * N_BITS + HIDDEN + HIDDEN + 1
+    print(f"[MODEL] MLP: {N_BITS} → {HIDDEN} → 1  ({total:,} parameters)")
+    return W1, b1, W2, b2
 
 # =============================================================================
-# 2. MODEL: raw parameter tensors (no nn.Module, no autograd)
+# 3. FORWARD PASS
 # =============================================================================
 
-def init_params(n_in, n_hidden):
+def forward(x, W1, b1, W2, b2):
     """
-    Initialize a 2-layer MLP as raw tensors.
-    Kaiming initialization for ReLU layers.
-    Returns a dict of {name: tensor}.
+    Forward pass for a single sample.
+    x → W1·x + b1 → ReLU → W2·h + b2 → scalar output
+    Returns (out, h_pre, h)
     """
-    # Layer 1: (n_hidden, n_in)
-    W1 = torch.randn(n_hidden, n_in) * (2.0 / n_in) ** 0.5
-    b1 = torch.zeros(n_hidden)
-    # Layer 2: (1, n_hidden)
-    W2 = torch.randn(1, n_hidden) * (2.0 / n_hidden) ** 0.5
-    b2 = torch.zeros(1)
+    # Layer 1
+    h_pre = [sum(W1[j][i] * x[i] for i in range(len(x))) + b1[j]
+             for j in range(len(W1))]
+    # ReLU
+    h = [max(0.0, hp) for hp in h_pre]
+    # Layer 2
+    out = sum(W2[0][j] * h[j] for j in range(len(h))) + b2[0]
+    return out, h_pre, h
 
-    params = {'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2}
-    total = sum(p.numel() for p in params.values())
-    print(f"[MODEL] MLP: {n_in} → {n_hidden} → 1  ({total:,} parameters)")
-    return params
-
-
-# =============================================================================
-# 3. FORWARD PASS (manual)
-# =============================================================================
-
-def forward(x, params):
-    """
-    Forward pass through 2-layer ReLU MLP.
-
-    Args:
-        x: input tensor, shape (batch, n_in) or (n_in,)
-        params: dict with W1, b1, W2, b2
-
-    Returns:
-        out: scalar output per sample, shape (batch,)
-        cache: intermediates needed for backward
-    """
-    # Layer 1: linear + ReLU
-    h_pre = x @ params['W1'].T + params['b1']     # (batch, hidden)
-    h = torch.clamp(h_pre, min=0)                  # ReLU
-
-    # Layer 2: linear
-    out = h @ params['W2'].T + params['b2']        # (batch, 1)
-    out = out.squeeze(-1)                           # (batch,)
-
-    cache = (x, h_pre, h)
-    return out, cache
-
+def forward_batch(xs, W1, b1, W2, b2):
+    """Forward pass for a batch. Returns list of outputs."""
+    return [forward(x, W1, b1, W2, b2)[0] for x in xs]
 
 # =============================================================================
-# 4. LOSS (manual)
+# 4. LOSS & ACCURACY
 # =============================================================================
 
-def hinge_loss(out, y):
-    """Hinge loss: mean(max(0, 1 - out * y))"""
-    return torch.clamp(1.0 - out * y, min=0.0).mean().item()
+def hinge_loss_batch(outs, ys):
+    """Mean hinge loss over a batch."""
+    return sum(max(0.0, 1.0 - o * y) for o, y in zip(outs, ys)) / len(ys)
 
-
-def compute_accuracy(out, y):
-    """Fraction of samples where sign(out) == y."""
-    return (out.sign() == y).float().mean().item()
-
+def accuracy(outs, ys):
+    """Fraction where sign(out) == y."""
+    correct = sum(1 for o, y in zip(outs, ys)
+                  if (1.0 if o >= 0 else -1.0) == y)
+    return correct / len(ys)
 
 # =============================================================================
-# 5. BACKWARD PASS + SGD UPDATE (manual — no .backward(), no autograd)
+# 5. BACKWARD + SGD UPDATE (manual — the part to customize)
 # =============================================================================
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │                    🔧 OPTIMIZER INJECTION POINT 🔧                     │
 # │                                                                         │
 # │  To swap in an experimental learning algorithm, replace the body of     │
-# │  `backward_and_update()`. You have full access to:                      │
+# │  backward_and_update(). You have full access to:                        │
 # │    - x, y: the single training sample                                   │
-# │    - out, cache: forward pass outputs and intermediates                 │
-# │    - params: all model weights as raw tensors                           │
+# │    - out, h_pre, h: forward pass intermediates                         │
+# │    - W1, b1, W2, b2: all model weights as plain Python lists           │
 # │                                                                         │
-# │  The math below is fully explicit — modify any part of the gradient     │
-# │  computation or update rule (e.g. gradient normalization, SVD-based     │
-# │  updates, evolutionary perturbation, etc.)                              │
+# │  Modify any part of the gradient computation or update rule.            │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-def backward_and_update(x, y, out, cache, params, lr=LEARNING_RATE, wd=WEIGHT_DECAY):
+def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2):
     """
-    Manual backward pass + SGD update for a single sample.
+    Manual backward pass + SGD with weight decay for one sample.
 
-    Architecture:  x → [W1, b1] → ReLU → [W2, b2] → out
-    Loss:          L = max(0, 1 - out * y)
-
-    Gradients are derived by hand and applied inline.
-    Weight decay: param -= lr * (grad + wd * param)
+    x → [W1, b1] → ReLU → [W2, b2] → out
+    L = max(0, 1 - out·y)
     """
-    x_i, h_pre, h = cache  # x_i: (1, n), h_pre: (1, hidden), h: (1, hidden)
-
-    margin = (out * y).item()
+    margin = out * y
     if margin >= 1.0:
         return  # hinge loss is 0, no gradient
 
-    # ── dL/dout ──────────────────────────────────────────────────────────
-    # L = max(0, 1 - out·y),  dL/dout = -y  (when margin < 1)
-    dout = -y                                      # (1,)
+    # dL/dout = -y
+    dout = -y
 
-    # ── Layer 2 backward: out = W2 @ h + b2 ─────────────────────────────
-    dW2 = dout.unsqueeze(1) * h                    # (1, hidden)
-    db2 = dout                                     # (1,)
-    dh  = params['W2'].T * dout                    # (hidden, 1) → broadcast
+    # Layer 2 backward: out = W2·h + b2
+    dW2_0 = [dout * h[j] for j in range(HIDDEN)]
+    db2_0 = dout
+    dh = [W2[0][j] * dout for j in range(HIDDEN)]
 
-    # ── ReLU backward: h = relu(h_pre) ──────────────────────────────────
-    dh_pre = dh.T * (h_pre > 0).float()            # (1, hidden)
+    # ReLU backward
+    dh_pre = [dh[j] * (1.0 if h_pre[j] > 0 else 0.0) for j in range(HIDDEN)]
 
-    # ── Layer 1 backward: h_pre = W1 @ x + b1 ──────────────────────────
-    dW1 = dh_pre.T @ x_i                           # (hidden, n)
-    db1 = dh_pre.squeeze(0)                        # (hidden,)
+    # Layer 1 backward: h_pre = W1·x + b1
+    # dW1[j][i] = dh_pre[j] * x[i]
+    # db1[j] = dh_pre[j]
 
-    # ── SGD update with weight decay ────────────────────────────────────
-    grads = {'W1': dW1, 'b1': db1, 'W2': dW2, 'b2': db2}
-    for name in params:
-        params[name] -= lr * (grads[name] + wd * params[name])
+    # SGD update with weight decay: p -= lr * (grad + wd * p)
+    for j in range(HIDDEN):
+        for i in range(N_BITS):
+            grad = dh_pre[j] * x[i]
+            W1[j][i] -= LR * (grad + WD * W1[j][i])
+        b1[j] -= LR * (dh_pre[j] + WD * b1[j])
 
-
-# =============================================================================
-# 6. ENERGY TRACKER
-# =============================================================================
-
-class EnergyTracker:
-    """Tracks steps to perfect generalization + per-step losses for plotting."""
-
-    def __init__(self):
-        self.train_accs = []
-        self.test_accs = []
-        self.train_losses = []
-        self.test_losses = []
-        self.generalization_epoch = None
-        self.step_count = 0
-
-    def record_step(self):
-        self.step_count += 1
-
-    def update(self, epoch, train_acc, test_acc, train_loss, test_loss):
-        self.train_accs.append(train_acc)
-        self.test_accs.append(test_acc)
-        self.train_losses.append(train_loss)
-        self.test_losses.append(test_loss)
-        if test_acc >= 1.0 and self.generalization_epoch is None:
-            self.generalization_epoch = epoch
-
-    @property
-    def has_generalized(self):
-        return self.generalization_epoch is not None
-
-    def report(self):
-        lines = [
-            "",
-            "=" * 65,
-            "  ENERGY COST REPORT",
-            "=" * 65,
-            f"  Total optimizer steps: {self.step_count}",
-        ]
-        if self.has_generalized:
-            lines.append(f"  ✅ Perfect generalization at epoch {self.generalization_epoch}")
-            lines.append(f"  ⚡ ENERGY COST = {self.generalization_epoch} epochs "
-                         f"({self.step_count} optimizer steps)")
-        else:
-            lines.append(f"  ❌ Did NOT reach 100% test accuracy within "
-                         f"{len(self.train_accs)} steps")
-            best_test = max(self.test_accs)
-            best_step = self.test_accs.index(best_test)
-            lines.append(f"  Best test accuracy: {best_test:.2%} at step {best_step}")
-            lines.append(f"  ⚡ ENERGY COST = ∞ (failed to generalize)")
-        lines.append(f"  Final train loss:     {self.train_losses[-1]:.6f}")
-        lines.append(f"  Final test loss:      {self.test_losses[-1]:.6f}")
-        lines.append(f"  Final train accuracy: {self.train_accs[-1]:.2%}")
-        lines.append(f"  Final test accuracy:  {self.test_accs[-1]:.2%}")
-        lines.append("=" * 65)
-        return "\n".join(lines)
-
+    for j in range(HIDDEN):
+        W2[0][j] -= LR * (dW2_0[j] + WD * W2[0][j])
+    b2[0] -= LR * (db2_0 + WD * b2[0])
 
 # =============================================================================
-# 7. TRAINING LOOP
+# 6. TRAINING LOOP
 # =============================================================================
 
-def train(params, x_train, y_train, x_test, y_test,
-          max_epochs=MAX_EPOCHS, log_interval=LOG_INTERVAL, patience=PATIENCE):
-    """
-    Single-sample cyclic training loop with manual backprop.
-    Evaluates full-batch train/test loss after every optimizer step.
-    """
-    tracker = EnergyTracker()
+def train(W1, b1, W2, b2, x_train, y_train, x_test, y_test):
+    """Single-sample cyclic training with per-step evaluation."""
+
+    # History for plotting
+    train_losses, test_losses = [], []
+    train_accs, test_accs = [], []
+    step = 0
+    gen_epoch = None
     best_test_acc = 0.0
-    epochs_without_improvement = 0
-    n_train = len(x_train)
-    x_all = torch.cat([x_train, x_test], dim=0)
-    y_all = torch.cat([y_train, y_test], dim=0)
+    epochs_no_improve = 0
 
-    print(f"\n[TRAIN] Starting training for up to {max_epochs} epochs...")
+    print(f"\n[TRAIN] Starting training for up to {MAX_EPOCHS} epochs...")
     print(f"[TRAIN] Mode: single-sample cyclic (batch_size=1, fixed order)")
-    print(f"[TRAIN] Steps per epoch: {n_train}")
-    print(f"[TRAIN] Loss: Hinge Loss")
-    print(f"[TRAIN] Log interval: every {log_interval} epochs\n")
+    print(f"[TRAIN] Steps per epoch: {N_TRAIN}")
+    print(f"[TRAIN] Loss: Hinge Loss\n")
 
-    start_time = time.time()
+    start = time.time()
 
-    for epoch in range(1, max_epochs + 1):
-        for i in range(n_train):
-            # Single-sample forward
-            x_i = x_train[i:i+1]
-            y_i = y_train[i:i+1]
-            out_i, cache = forward(x_i, params)
+    for epoch in range(1, MAX_EPOCHS + 1):
+        for i in range(N_TRAIN):
+            # Forward on single sample
+            out, h_pre, h = forward(x_train[i], W1, b1, W2, b2)
 
-            # Backward + update (manual — no autograd)
-            backward_and_update(x_i, y_i, out_i, cache, params)
-            tracker.record_step()
+            # Backward + update
+            backward_and_update(x_train[i], y_train[i], out, h_pre, h,
+                                W1, b1, W2, b2)
+            step += 1
 
-            # Evaluate full-batch train & test after every step
-            with torch.no_grad():
-                all_out, _ = forward(x_all, params)
-                train_out = all_out[:n_train]
-                test_out  = all_out[n_train:]
-                train_loss = hinge_loss(train_out, y_train)
-                test_loss  = hinge_loss(test_out,  y_test)
-                train_acc  = compute_accuracy(train_out, y_train)
-                test_acc   = compute_accuracy(test_out,  y_test)
+            # Evaluate full-batch after every step
+            tr_outs = forward_batch(x_train, W1, b1, W2, b2)
+            te_outs = forward_batch(x_test, W1, b1, W2, b2)
+            tr_loss = hinge_loss_batch(tr_outs, y_train)
+            te_loss = hinge_loss_batch(te_outs, y_test)
+            tr_acc  = accuracy(tr_outs, y_train)
+            te_acc  = accuracy(te_outs, y_test)
 
-            tracker.update(epoch, train_acc, test_acc, train_loss, test_loss)
+            train_losses.append(tr_loss)
+            test_losses.append(te_loss)
+            train_accs.append(tr_acc)
+            test_accs.append(te_acc)
+
+            if te_acc >= 1.0 and gen_epoch is None:
+                gen_epoch = epoch
 
             # Logging
-            if tracker.step_count % (log_interval * n_train) == 0 or tracker.step_count == 1:
-                print(f"\n{'─' * 65}")
-                print(f"[STEP {tracker.step_count}] epoch={epoch}, sample={i}  "
-                      f"train_loss={train_loss:.6f}  test_loss={test_loss:.6f}  "
-                      f"train_acc={train_acc:.2%}  test_acc={test_acc:.2%}")
+            if step % (LOG_EVERY * N_TRAIN) == 0 or step == 1:
+                print(f"[STEP {step:>4}] epoch={epoch}  "
+                      f"train_loss={tr_loss:.4f}  test_loss={te_loss:.4f}  "
+                      f"train_acc={tr_acc:.0%}  test_acc={te_acc:.0%}")
 
-                print(f"  Train predictions (raw → sign vs target):")
-                for j in range(n_train):
-                    raw = train_out[j].item()
-                    pred = 1 if raw >= 0 else -1
-                    tgt = int(y_train[j].item())
-                    print(f"    sample {j:>2}: f(x)={raw:+.4f}  "
-                          f"pred={pred:+d}  target={tgt:+d}  "
-                          f"{'✓' if pred == tgt else '✗'}")
+                # Per-sample predictions
+                for label, outs, ys in [("Train", tr_outs, y_train),
+                                         ("Test",  te_outs, y_test)]:
+                    print(f"  {label} predictions:")
+                    for j, (o, t) in enumerate(zip(outs, ys)):
+                        pred = 1 if o >= 0 else -1
+                        tgt = int(t)
+                        ok = "✓" if pred == tgt else "✗"
+                        print(f"    {j:>2}: f(x)={o:+.4f}  "
+                              f"pred={pred:+d}  target={tgt:+d}  {ok}")
 
-                print(f"  Test predictions (raw → sign vs target):")
-                for j in range(len(x_test)):
-                    raw = test_out[j].item()
-                    pred = 1 if raw >= 0 else -1
-                    tgt = int(y_test[j].item())
-                    print(f"    sample {j:>2}: f(x)={raw:+.4f}  "
-                          f"pred={pred:+d}  target={tgt:+d}  "
-                          f"{'✓' if pred == tgt else '✗'}")
+                print(f"  Weight norms: |W1|={mat_norm(W1):.4f}  "
+                      f"|b1|={norm(b1):.4f}  |W2|={mat_norm(W2):.4f}  "
+                      f"|b2|={abs(b2[0]):.4f}")
 
-                print(f"  Weight norms:")
-                for name, p in params.items():
-                    print(f"    {name:>4s}: |W|={p.norm().item():.4f}")
-
-        # Early stopping on perfect generalization
-        if tracker.has_generalized:
-            elapsed = time.time() - start_time
+        # Early stopping
+        if gen_epoch is not None:
+            elapsed = time.time() - start
             print(f"\n  🎉 GENERALIZED at epoch {epoch}! "
-                  f"({tracker.step_count} steps, {elapsed:.1f}s)")
+                  f"({step} steps, {elapsed:.1f}s)")
             break
 
-        # Patience
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
-            epochs_without_improvement = 0
+        if te_acc > best_test_acc:
+            best_test_acc = te_acc
+            epochs_no_improve = 0
         else:
-            epochs_without_improvement += 1
-        if epochs_without_improvement >= patience:
-            print(f"\n[TRAIN] Stopping: no test improvement in {patience} epochs.")
+            epochs_no_improve += 1
+        if epochs_no_improve >= PATIENCE:
+            print(f"\n[TRAIN] Stopping: no improvement in {PATIENCE} epochs.")
             break
 
-    elapsed = time.time() - start_time
+    elapsed = time.time() - start
     print(f"[TRAIN] Finished in {elapsed:.1f}s "
-          f"({epoch} epochs, {tracker.step_count} total steps)")
-    return tracker
+          f"({epoch} epochs, {step} total steps)")
 
+    return {
+        'train_losses': train_losses, 'test_losses': test_losses,
+        'train_accs': train_accs, 'test_accs': test_accs,
+        'step_count': step, 'gen_epoch': gen_epoch,
+    }
 
 # =============================================================================
-# 8. PLOTTING
+# 7. REPORT
 # =============================================================================
 
-def plot_losses(tracker, save_path="loss_plot.png"):
+def print_report(r):
+    """Print energy cost report."""
+    print(f"\n{'=' * 65}")
+    print(f"  ENERGY COST REPORT")
+    print(f"{'=' * 65}")
+    print(f"  Total optimizer steps: {r['step_count']}")
+    if r['gen_epoch'] is not None:
+        print(f"  ✅ Perfect generalization at epoch {r['gen_epoch']}")
+        print(f"  ⚡ ENERGY COST = {r['gen_epoch']} epochs "
+              f"({r['step_count']} optimizer steps)")
+    else:
+        print(f"  ❌ Did NOT reach 100% test accuracy")
+        best = max(r['test_accs'])
+        best_step = r['test_accs'].index(best)
+        print(f"  Best test accuracy: {best:.0%} at step {best_step}")
+        print(f"  ⚡ ENERGY COST = ∞ (failed to generalize)")
+    print(f"  Final train loss:     {r['train_losses'][-1]:.6f}")
+    print(f"  Final test loss:      {r['test_losses'][-1]:.6f}")
+    print(f"  Final train accuracy: {r['train_accs'][-1]:.0%}")
+    print(f"  Final test accuracy:  {r['test_accs'][-1]:.0%}")
+    print(f"{'=' * 65}")
+
+# =============================================================================
+# 8. PLOTTING (the only dependency beyond stdlib)
+# =============================================================================
+
+def plot_losses(r, save_path="loss_plot.png"):
     """Plot training and test loss/accuracy curves."""
     try:
         import matplotlib
@@ -357,36 +340,35 @@ def plot_losses(tracker, save_path="loss_plot.png"):
         import matplotlib.pyplot as plt
     except ImportError:
         import subprocess, sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib", "--quiet"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "matplotlib", "--quiet"])
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-    steps = list(range(1, len(tracker.train_losses) + 1))
+    steps = list(range(1, len(r['train_losses']) + 1))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    ax1.plot(steps, tracker.train_losses, label='Train Loss', lw=1.2, color='#2196F3')
-    ax1.plot(steps, tracker.test_losses,  label='Test Loss',  lw=1.2, color='#F44336')
-    ax1.set(xlabel='Optimizer Step', ylabel='Hinge Loss', title='Training & Test Loss (per step)')
+    ax1.plot(steps, r['train_losses'], label='Train', lw=1.2, color='#2196F3')
+    ax1.plot(steps, r['test_losses'],  label='Test',  lw=1.2, color='#F44336')
+    ax1.set(xlabel='Step', ylabel='Hinge Loss', title='Loss (per step)')
     ax1.legend(); ax1.grid(True, alpha=0.3)
 
-    ax2.plot(steps, tracker.train_accs, label='Train Accuracy', lw=1.2, color='#2196F3')
-    ax2.plot(steps, tracker.test_accs,  label='Test Accuracy',  lw=1.2, color='#F44336')
-    ax2.set(xlabel='Optimizer Step', ylabel='Accuracy', title='Training & Test Accuracy (per step)')
+    ax2.plot(steps, r['train_accs'], label='Train', lw=1.2, color='#2196F3')
+    ax2.plot(steps, r['test_accs'],  label='Test',  lw=1.2, color='#F44336')
+    ax2.set(xlabel='Step', ylabel='Accuracy', title='Accuracy (per step)')
     ax2.legend(); ax2.grid(True, alpha=0.3); ax2.set_ylim(-0.05, 1.05)
 
-    if tracker.generalization_epoch is not None:
+    if r['gen_epoch'] is not None:
         for ax in (ax1, ax2):
-            ax.axvline(x=tracker.generalization_epoch, color='green',
-                       linestyle='--', alpha=0.7, label='Generalized')
+            ax.axvline(x=r['gen_epoch'], color='green', ls='--', alpha=0.7)
 
-    fig.suptitle('Sparse Parity Benchmark — Loss & Accuracy Curves',
+    fig.suptitle('Sparse Parity Benchmark — Pure Python',
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"\n[PLOT] Saved loss/accuracy plot to: {save_path}")
+    print(f"\n[PLOT] Saved to: {save_path}")
     plt.close(fig)
-
 
 # =============================================================================
 # 9. MAIN
@@ -396,42 +378,35 @@ def main():
     total_start = time.time()
 
     print("=" * 65)
-    print("  SPARSE PARITY BENCHMARK — Energy Efficiency Testbed")
-    print("  (No autodiff — all gradients computed by hand)")
+    print("  SPARSE PARITY BENCHMARK — Pure Python, No Dependencies")
     print("=" * 65)
 
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    # --- Initialization ---
+    # --- Init ---
     init_start = time.time()
     x_train, y_train, x_test, y_test, secret = create_datasets()
-    print(f"[DATA] Train labels: {y_train.tolist()}")
-    print(f"[DATA] Test labels:  {y_test.tolist()}")
-    params = init_params(N_BITS, HIDDEN_DIM)
+    print(f"[DATA] Train labels: {[int(y) for y in y_train]}")
+    print(f"[DATA] Test labels:  {[int(y) for y in y_test]}")
+    W1, b1, W2, b2 = init_params()
     init_elapsed = time.time() - init_start
 
     # --- Simulation ---
     sim_start = time.time()
-    tracker = train(params, x_train, y_train, x_test, y_test)
+    results = train(W1, b1, W2, b2, x_train, y_train, x_test, y_test)
     sim_elapsed = time.time() - sim_start
 
     # --- Report ---
-    print(tracker.report())
+    print_report(results)
 
     # --- Plot ---
     plot_start = time.time()
-    plot_losses(tracker)
+    plot_losses(results)
     plot_elapsed = time.time() - plot_start
 
     total_elapsed = time.time() - total_start
-    print(f"\n[TIMING] Initialization:  {init_elapsed:.3f}s  (data + model)")
+    print(f"\n[TIMING] Initialization:  {init_elapsed:.3f}s")
     print(f"[TIMING] Simulation:      {sim_elapsed:.3f}s  (training loop)")
     print(f"[TIMING] Plotting:        {plot_elapsed:.3f}s  (matplotlib)")
     print(f"[TIMING] Total wall time: {total_elapsed:.3f}s")
-
-    return tracker
-
 
 if __name__ == "__main__":
     main()
