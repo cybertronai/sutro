@@ -38,7 +38,7 @@ SEED = 42
 
 HIDDEN_DIM = 1000     # hidden layer width
 
-LEARNING_RATE = 0.1
+LEARNING_RATE = 0.5
 WEIGHT_DECAY = 0.01   # L2 regularization — critical for grokking
 MAX_EPOCHS = 10       # 10 epochs × 20 samples = 200 optimizer steps
 LOG_INTERVAL = 1      # print every epoch
