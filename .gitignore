@@ -4,8 +4,6 @@ __pycache__/
 *.pyo
 .env
 
-# Generated outputs
-loss_plot.png
 
 # IDE / Editor
 .vscode/
