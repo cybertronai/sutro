@@ -256,7 +256,14 @@ def accuracy(outs, ys):
 
 def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2, mem=None):
     """
-    Manual backward + SGD with weight decay, instrumented for reuse tracking.
+    Manual backward + SGD with FUSED layer-wise updates.
+
+    Instead of:  grad_all → update_all  (standard backprop)
+    We do:       grad_layer2 → update_layer2 → grad_layer1 → update_layer1
+
+    This is mathematically identical but reduces reuse distance: each
+    gradient buffer (dW2, db2, dW1, db1) is consumed immediately after
+    creation, and parameters are re-read while still in cache.
 
     x → [W1, b1] → ReLU → [W2, b2] → out
     L = max(0, 1 - out·y)
@@ -274,20 +281,20 @@ def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2, mem=None):
     if mem:
         mem.write('dout', 1)
 
-    # Layer 2 backward: out = W2·h + b2
+    # ── Layer 2 backward: out = W2·h + b2 ───────────────────────────────
+    # Compute dW2, db2
     if mem:
         mem.read('dout', 1)
         mem.read('h', HIDDEN)
 
     dW2_0 = [dout * h[j] for j in range(HIDDEN)]
+    db2_0 = dout
 
     if mem:
         mem.write('dW2', HIDDEN)
-
-    db2_0 = dout
-    if mem:
         mem.write('db2', 1)
 
+    # Compute dh BEFORE updating W2 (needs pre-update W2)
     if mem:
         mem.read('W2', HIDDEN)
         mem.read('dout', 1)
@@ -297,7 +304,25 @@ def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2, mem=None):
     if mem:
         mem.write('dh', HIDDEN)
 
-    # ReLU backward
+    # ── FUSED: Update W2, b2 immediately (dW2, db2 still in cache) ──────
+    if mem:
+        mem.read('dW2', HIDDEN)
+        mem.read('W2', HIDDEN)
+
+    for j in range(HIDDEN):
+        W2[0][j] -= LR * (dW2_0[j] + WD * W2[0][j])
+
+    if mem:
+        mem.write('W2', HIDDEN)
+        mem.read('db2', 1)
+        mem.read('b2', 1)
+
+    b2[0] -= LR * (db2_0 + WD * b2[0])
+
+    if mem:
+        mem.write('b2', 1)
+
+    # ── ReLU backward ────────────────────────────────────────────────────
     if mem:
         mem.read('dh', HIDDEN)
         mem.read('h_pre', HIDDEN)
@@ -307,10 +332,7 @@ def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2, mem=None):
     if mem:
         mem.write('dh_pre', HIDDEN)
 
-    # Layer 1 backward: h_pre = W1·x + b1
-    # dW1[j][i] = dh_pre[j] * x[i],  db1[j] = dh_pre[j]
-
-    # SGD update with weight decay: p -= lr * (grad + wd * p)
+    # ── FUSED: Layer 1 backward + update W1, b1 immediately ─────────────
     if mem:
         mem.read('dh_pre', HIDDEN)
         mem.read('x', N_BITS)
@@ -331,21 +353,6 @@ def backward_and_update(x, y, out, h_pre, h, W1, b1, W2, b2, mem=None):
 
     if mem:
         mem.write('b1', HIDDEN)
-        mem.read('dW2', HIDDEN)
-        mem.read('W2', HIDDEN)
-
-    for j in range(HIDDEN):
-        W2[0][j] -= LR * (dW2_0[j] + WD * W2[0][j])
-
-    if mem:
-        mem.write('W2', HIDDEN)
-        mem.read('db2', 1)
-        mem.read('b2', 1)
-
-    b2[0] -= LR * (db2_0 + WD * b2[0])
-
-    if mem:
-        mem.write('b2', 1)
 
 # =============================================================================
 # 6. TRAINING LOOP
