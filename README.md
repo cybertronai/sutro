@@ -120,18 +120,3 @@ PyTorch sees: NVIDIA L4
 =======================================================
 ```
 
-## Customizing the Optimizer
-
-Find the marked section in the code:
-
-```python
-# ┌────────────────────────────────────────────────────────┐
-# │              🔧 OPTIMIZER INJECTION POINT 🔧           │
-# │                                                        │
-# │  Replace backward_and_update() with your custom        │
-# │  learning algorithm. All buffers are plain Python      │
-# │  lists — fully transparent.                            │
-# └────────────────────────────────────────────────────────┘
-```
-
-Replace the body of `backward_and_update()` with any update rule — gradient normalization, evolutionary perturbation, SVD-based updates, etc.
