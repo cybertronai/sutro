@@ -86,6 +86,40 @@ Gradient buffers `dW2`, `db2` flipped from ❌ to ✅ — consumed while still i
 
 ![Loss & Accuracy Curves](loss_plot.png)
 
+## GPU Toy Problem (Modal)
+
+`gpu_toy.py` runs a matrix-multiply benchmark on a cloud **NVIDIA L4 GPU** via [Modal](https://modal.com), with cost tracking.
+
+### Setup
+
+```bash
+uv init && uv add modal     # install modal
+uv run python -m modal setup # authenticate (opens browser)
+```
+
+### Run
+
+```bash
+uv run modal run gpu_toy.py
+```
+
+### Sample Output
+
+```
+NVIDIA L4  |  23034 MiB  |  CUDA 13.0
+
+PyTorch sees: NVIDIA L4
+100 matmuls (4096×4096) in 1.127s  (12.20 TFLOPS)
+
+=======================================================
+  GPU TFLOPS:          12.20
+  GPU compute time:    1.127s
+  Container time:      1.9s
+  Total wall time:     12.6s  (incl. startup)
+  Estimated cost:      $0.0030  (L4 @ $0.84/hr)
+=======================================================
+```
+
 ## Customizing the Optimizer
 
 Find the marked section in the code:
