@@ -97,7 +97,9 @@ python3 compare_reuse_distance.py
 | Metric | SGD MLP | GF(2) Gauss Elim | Ratio |
 |---|---|---|---|
 | **Weighted avg reuse distance** | 2,584 | 75 | **34×** smaller |
-| **Time to 100% accuracy** (n=3, k=3) | 151,198 µs | 107 µs | **1,409×** faster |
+| **Time to 100% accuracy** (n=3, k=3) | 133 ms | 131 µs | **1,014×** faster |
+| **Total FLOPs to 100%** | 1,158,951 | 460 | **2,519×** fewer |
+| **Total memory reads to 100%** | 755,514 | 613 | **1,232×** fewer |
 | Working set | 2,725 elements | 1,364 elements | 2× smaller |
 
 ### Why GF(2) wins

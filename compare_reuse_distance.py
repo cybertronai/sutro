@@ -3,8 +3,7 @@
 compare_reuse_distance.py — Side-by-side energy efficiency comparison
 
 Runs both SGD MLP and GF(2) Gaussian Elimination on the same sparse parity
-problem and compares their memory reuse distance (a proxy for cache/energy
-efficiency).
+problem and compares: reuse distance, runtime, FLOPs, and memory reads.
 
 Usage:
     python3 compare_reuse_distance.py
@@ -19,21 +18,21 @@ import time
 # =============================================================================
 
 # Reuse distance comparison (per-step)
-N_BITS   = 20       # input dimension
-K_SPARSE = 3        # parity bits
-N_TRAIN  = 21       # n+1 samples (minimum for GF(2))
-HIDDEN   = 100      # MLP hidden width
+N_BITS   = 20
+K_SPARSE = 3
+N_TRAIN  = 21
+HIDDEN   = 100
 
-# Convergence timing (must be small enough for SGD to converge in pure Python)
-CONV_N     = 3
-CONV_K     = 3
-CONV_TRAIN = 20
-CONV_TEST  = 20
+# Convergence timing (small enough for SGD to converge in pure Python)
+CONV_N      = 3
+CONV_K      = 3
+CONV_TRAIN  = 20
+CONV_TEST   = 20
 CONV_HIDDEN = 1000
 
-LR       = 0.5
-WD       = 0.01
-SEED     = 42
+LR = 0.5
+WD = 0.01
+SEED = 42
 
 
 # =============================================================================
@@ -41,13 +40,9 @@ SEED     = 42
 # =============================================================================
 
 class MemTracker:
-    """
-    Tracks Average Reuse Distance (ARD) — a proxy for energy efficiency.
-    Clock advances by buffer SIZE (elements), not operation count.
-    """
     def __init__(self):
         self.clock = 0
-        self._last_access = {}   # name → clock at last read or write
+        self._last_access = {}
         self._write_size = {}
         self._events = []
 
@@ -71,26 +66,18 @@ class MemTracker:
         writes = [e for e in self._events if e[0] == 'W']
         if not reads:
             return {}
-
         total_float_dist = sum(s * d for _, s, d in reads)
         total_floats = sum(s for _, s, _ in reads)
         weighted_ard = total_float_dist / total_floats if total_floats else 0
         per_read_ard = sum(d for _, _, d in reads) / len(reads)
-
         buf = {}
         for n, s, d in reads:
             buf.setdefault(n, {'size': s, 'dists': []})['dists'].append(d)
-
         working_set = sum(self._write_size.values())
-
         return {
-            'weighted_ard': weighted_ard,
-            'per_read_ard': per_read_ard,
-            'total_accessed': self.clock,
-            'total_read': total_floats,
-            'working_set': working_set,
-            'n_reads': len(reads),
-            'n_writes': len(writes),
+            'weighted_ard': weighted_ard, 'per_read_ard': per_read_ard,
+            'total_accessed': self.clock, 'total_read': total_floats,
+            'working_set': working_set, 'n_reads': len(reads), 'n_writes': len(writes),
             'per_buffer': buf,
         }
 
@@ -100,15 +87,12 @@ class MemTracker:
             print(f"  No data for {title}")
             return s
         ws = s['working_set']
-
         print(f"\n{'═' * 72}")
         print(f"  {title}")
         print(f"{'═' * 72}")
         print(f"  Total elements accessed: {s['total_accessed']:>10,}")
         print(f"  Total elements read:     {s['total_read']:>10,}")
         print(f"  Working set:             {s['working_set']:>10,}")
-        print(f"  Read operations:         {s['n_reads']:>10}")
-        print(f"  Write operations:        {s['n_writes']:>10}")
 
         print(f"\n  {'Buffer':<14} {'Size':>8} {'Reads':>5} {'Avg Dist':>10}"
               f" {'Min':>8} {'Max':>8} {'Cache?':>6}")
@@ -129,7 +113,7 @@ class MemTracker:
 
 
 # =============================================================================
-# DATA GENERATION (shared)
+# DATA GENERATION
 # =============================================================================
 
 def generate_data(n, k, n_samples, seed):
@@ -146,224 +130,214 @@ def generate_data(n, k, n_samples, seed):
 
 
 # =============================================================================
-# ALGORITHM 1: SGD MLP (one forward + backward step)
+# ALGORITHM 1: SGD MLP — reuse distance (1 step)
 # =============================================================================
 
 def run_sgd_step(xs, ys, n, hidden, lr, wd, seed):
     mem = MemTracker()
     rng = random.Random(seed)
 
-    # Init parameters
     std1 = math.sqrt(2.0 / n)
     std2 = math.sqrt(2.0 / hidden)
     W1 = [[rng.gauss(0, std1) for _ in range(n)] for _ in range(hidden)]
     b1 = [0.0] * hidden
     W2 = [[rng.gauss(0, std2) for _ in range(hidden)]]
     b2 = [0.0]
+    x, y = xs[0], ys[0]
 
-    x = xs[0]
-    y = ys[0]
+    mem.write('W1', hidden * n); mem.write('b1', hidden)
+    mem.write('W2', hidden);    mem.write('b2', 1)
+    mem.write('x', n);          mem.write('y', 1)
 
-    # Register initial writes
-    mem.write('W1', hidden * n)
-    mem.write('b1', hidden)
-    mem.write('W2', hidden)
-    mem.write('b2', 1)
-    mem.write('x', n)
-    mem.write('y', 1)
-
-    # ── FORWARD ──────────────────────────────────────────────────────────
-    # Layer 1: h_pre = W1·x + b1
-    mem.read('x', n)
-    mem.read('W1', hidden * n)
-    mem.read('b1', hidden)
+    # Forward
+    mem.read('x', n); mem.read('W1', hidden * n); mem.read('b1', hidden)
     h_pre = [sum(W1[j][i] * x[i] for i in range(n)) + b1[j] for j in range(hidden)]
     mem.write('h_pre', hidden)
-
-    # ReLU
     mem.read('h_pre', hidden)
     h = [max(0.0, hp) for hp in h_pre]
     mem.write('h', hidden)
-
-    # Layer 2: out = W2·h + b2
-    mem.read('h', hidden)
-    mem.read('W2', hidden)
-    mem.read('b2', 1)
+    mem.read('h', hidden); mem.read('W2', hidden); mem.read('b2', 1)
     out = sum(W2[0][j] * h[j] for j in range(hidden)) + b2[0]
     mem.write('out', 1)
 
-    # ── BACKWARD (fused layer-wise updates) ──────────────────────────────
-    mem.read('out', 1)
-    mem.read('y', 1)
-    margin = out * y
-
+    # Backward (fused)
+    mem.read('out', 1); mem.read('y', 1)
     dout = -y
     mem.write('dout', 1)
-
-    # Layer 2 gradients
-    mem.read('dout', 1)
-    mem.read('h', hidden)
+    mem.read('dout', 1); mem.read('h', hidden)
     dW2_0 = [dout * h[j] for j in range(hidden)]
-    db2_0 = dout
-    mem.write('dW2', hidden)
-    mem.write('db2', 1)
-
-    # Compute dh BEFORE updating W2 (needs pre-update W2)
-    mem.read('W2', hidden)
-    mem.read('dout', 1)
+    mem.write('dW2', hidden); mem.write('db2', 1)
+    mem.read('W2', hidden); mem.read('dout', 1)
     dh = [W2[0][j] * dout for j in range(hidden)]
     mem.write('dh', hidden)
-
-    # FUSED: Update W2, b2 immediately
-    mem.read('dW2', hidden)
-    mem.read('W2', hidden)
+    mem.read('dW2', hidden); mem.read('W2', hidden)
     for j in range(hidden):
         W2[0][j] -= lr * (dW2_0[j] + wd * W2[0][j])
     mem.write('W2', hidden)
-
-    mem.read('db2', 1)
-    mem.read('b2', 1)
-    b2[0] -= lr * (db2_0 + wd * b2[0])
+    mem.read('db2', 1); mem.read('b2', 1)
+    b2[0] -= lr * (dout + wd * b2[0])
     mem.write('b2', 1)
-
-    # ReLU backward
-    mem.read('dh', hidden)
-    mem.read('h_pre', hidden)
+    mem.read('dh', hidden); mem.read('h_pre', hidden)
     dh_pre = [dh[j] * (1.0 if h_pre[j] > 0 else 0.0) for j in range(hidden)]
     mem.write('dh_pre', hidden)
-
-    # FUSED: Layer 1 backward + update W1, b1 immediately
-    mem.read('dh_pre', hidden)
-    mem.read('x', n)
-    mem.read('W1', hidden * n)
+    mem.read('dh_pre', hidden); mem.read('x', n); mem.read('W1', hidden * n)
     for j in range(hidden):
         for i in range(n):
             W1[j][i] -= lr * (dh_pre[j] * x[i] + wd * W1[j][i])
     mem.write('W1', hidden * n)
-
-    mem.read('dh_pre', hidden)
-    mem.read('b1', hidden)
+    mem.read('dh_pre', hidden); mem.read('b1', hidden)
     for j in range(hidden):
         b1[j] -= lr * (dh_pre[j] + wd * b1[j])
     mem.write('b1', hidden)
-
     return mem
 
 
 # =============================================================================
-# ALGORITHM 2: GF(2) Gaussian Elimination
+# ALGORITHM 2: GF(2) — reuse distance (1 solve)
 # =============================================================================
 
 def run_gf2_solve(xs, ys, n, n_samples):
     mem = MemTracker()
-
-    # Convert to GF(2): -1 → 0, +1 → 1
     A = [[int((xs[i][j] + 1) / 2) for j in range(n)] for i in range(n_samples)]
     b = [int((ys[i] + 1) / 2) for i in range(n_samples)]
 
     mem.write('x_input', n_samples * n)
-    mem.read('x_input', n_samples * n)  # read to convert
+    mem.read('x_input', n_samples * n)
     mem.write('A', n_samples * n)
     mem.write('y_input', n_samples)
-    mem.read('y_input', n_samples)      # read to convert
+    mem.read('y_input', n_samples)
     mem.write('b', n_samples)
 
-    # Build augmented matrix [A | b]
     row_len = n + 1
-    mem.read('A', n_samples * n)
-    mem.read('b', n_samples)
+    mem.read('A', n_samples * n); mem.read('b', n_samples)
     aug = [A[i][:] + [b[i]] for i in range(n_samples)]
     mem.write('aug', n_samples * row_len)
 
     m = n_samples
     pivot_row = 0
-
-    # ── Gaussian elimination ─────────────────────────────────────────────
     for col in range(n):
         remaining = m - pivot_row
         if remaining <= 0:
             break
-
-        # Pivot search: scan column
         mem.read('aug_col', remaining)
-
         found = -1
         for row in range(pivot_row, m):
             if aug[row][col] == 1:
                 found = row
                 break
-
         if found == -1:
             continue
-
-        # Row swap
         if found != pivot_row:
             mem.read('aug_row', 2 * row_len)
             aug[pivot_row], aug[found] = aug[found], aug[pivot_row]
             mem.write('aug_row', 2 * row_len)
-
-        # Eliminate: scan column, then XOR each matching row
         mem.read('aug_col', m)
-
         for row in range(m):
             if row != pivot_row and aug[row][col] == 1:
-                mem.read('aug_row', 2 * row_len)   # read pivot + target
+                mem.read('aug_row', 2 * row_len)
                 aug[row] = [aug[row][j] ^ aug[pivot_row][j] for j in range(row_len)]
-                mem.write('aug_row', row_len)        # write modified row
-
+                mem.write('aug_row', row_len)
         pivot_row += 1
 
-    rank = pivot_row
-
-    # Consistency check
-    if rank < m:
-        mem.read('aug_row', (m - rank) * row_len)
-
-    # Back-substitution
-    mem.read('aug_row', rank * row_len)
-    solution = [0] * n
+    if pivot_row < m:
+        mem.read('aug_row', (m - pivot_row) * row_len)
+    mem.read('aug_row', pivot_row * row_len)
     mem.write('solution', n)
-
     return mem
 
 
 # =============================================================================
-# MAIN: run both and compare
+# ANALYTICAL FLOP AND MEMORY READ COUNTING
 # =============================================================================
 
-def sgd_forward(x, W1, b1, W2, b2, n, hidden):
-    """Forward pass, returns (out, h_pre, h)."""
+def sgd_flops_per_step(n, h):
+    """FLOPs for one SGD forward+backward+update step."""
+    # Forward: h_pre=W1·x+b1: 2nh, ReLU: h, out=W2·h+b2: 2h
+    fwd = 2*n*h + h + 2*h
+    # Backward+update: margin(2), dout(1), dW2(h), dh(h),
+    #   W2 update(4h), b2 update(4), dh_pre(2h), W1 update(5nh), b1 update(4h)
+    bwd = 3 + h + h + 4*h + 4 + 2*h + 5*n*h + 4*h
+    return fwd, bwd
+
+def sgd_reads_per_step(n, h):
+    """Element reads for one SGD forward+backward+update step."""
+    # Forward: x(n)+W1(nh)+b1(h)+h_pre(h)+h(h)+W2(h)+b2(1)
+    fwd = n + n*h + h + h + h + h + 1
+    # Backward: out(1)+y(1)+dout(2)+h(h)+W2(h)+dout(1)+dW2(h)+W2(h)+db2(1)+b2(1)+
+    #           dh(h)+h_pre(h)+dh_pre(h)+x(n)+W1(nh)+dh_pre(h)+b1(h)
+    bwd = 1 + 1 + 1 + h + h + 1 + h + h + 1 + 1 + h + h + h + n + n*h + h + h
+    return fwd, bwd
+
+def sgd_fwd_reads(n, h):
+    """Reads for one forward pass only (test evaluation)."""
+    return n + n*h + h + h + h + h + 1
+
+def gf2_flops_and_reads(n, m):
+    """FLOPs and reads for GF(2) solve on m×n system (analytical worst-case)."""
+    row_len = n + 1
+    k = min(n, m)  # number of pivots
+
+    # Conversion: m*n adds + m*n divs + m adds + m divs
+    conv_flops = 2*m*n + 2*m
+    conv_reads = m*n + m  # read x_input + y_input
+
+    # Build augmented: read A + b
+    build_reads = m*n + m
+
+    # Gaussian elimination
+    elim_flops = 0
+    elim_reads = 0
+    for col in range(k):
+        rows_left = m - col
+        elim_reads += rows_left          # pivot scan (column)
+        elim_reads += m                  # elimination scan (column)
+        elim_flops += rows_left + m      # comparisons
+        # Avg rows eliminated per column ≈ m/2 (rough)
+        avg_elim = max(1, m // 2)
+        elim_reads += avg_elim * 2 * row_len  # read pivot + target rows
+        elim_flops += avg_elim * row_len       # XOR operations
+        # Row swap (sometimes)
+        elim_reads += 2 * row_len
+
+    # Back-substitution
+    backsub_reads = k * row_len
+    backsub_flops = k
+
+    # Verification (on test data, counted separately)
+    total_flops = conv_flops + elim_flops + backsub_flops
+    total_reads = conv_reads + build_reads + elim_reads + backsub_reads
+    return total_flops, total_reads
+
+
+# =============================================================================
+# CONVERGENCE FUNCTIONS
+# =============================================================================
+
+def sgd_forward_fn(x, W1, b1, W2, b2, n, hidden):
     h_pre = [sum(W1[j][i] * x[i] for i in range(n)) + b1[j] for j in range(hidden)]
     h = [max(0.0, hp) for hp in h_pre]
     out = sum(W2[0][j] * h[j] for j in range(hidden)) + b2[0]
     return out, h_pre, h
 
-
-def sgd_backward_update(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd):
-    """Backward + fused SGD update (no tracking, for convergence test)."""
+def sgd_bwd_fn(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd):
     margin = out * y
     if margin >= 1.0:
-        return
+        return False
     dout = -y
     dW2_0 = [dout * h[j] for j in range(hidden)]
-    db2_0 = dout
     dh = [W2[0][j] * dout for j in range(hidden)]
-    # Update W2, b2
     for j in range(hidden):
         W2[0][j] -= lr * (dW2_0[j] + wd * W2[0][j])
-    b2[0] -= lr * (db2_0 + wd * b2[0])
-    # ReLU backward
+    b2[0] -= lr * (dout + wd * b2[0])
     dh_pre = [dh[j] * (1.0 if h_pre[j] > 0 else 0.0) for j in range(hidden)]
-    # Update W1, b1
     for j in range(hidden):
         for i in range(n):
             W1[j][i] -= lr * (dh_pre[j] * x[i] + wd * W1[j][i])
     for j in range(hidden):
         b1[j] -= lr * (dh_pre[j] + wd * b1[j])
-
+    return True
 
 def run_sgd_to_convergence(xs_train, ys_train, xs_test, ys_test, n, hidden, lr, wd, seed, max_epochs=50):
-    """Train SGD MLP until 100% test accuracy. Returns (time, steps, test_acc)."""
     rng = random.Random(seed)
     std1 = math.sqrt(2.0 / n)
     std2 = math.sqrt(2.0 / hidden)
@@ -372,33 +346,41 @@ def run_sgd_to_convergence(xs_train, ys_train, xs_test, ys_test, n, hidden, lr, 
     W2 = [[rng.gauss(0, std2) for _ in range(hidden)]]
     b2 = [0.0]
 
+    flops_fwd, flops_bwd = sgd_flops_per_step(n, hidden)
+    reads_fwd, reads_bwd = sgd_reads_per_step(n, hidden)
+    fwd_reads_only = sgd_fwd_reads(n, hidden)
+
     t0 = time.time()
     steps = 0
-    best_acc = 0.0
+    total_flops = 0
+    total_reads = 0
+
     for epoch in range(1, max_epochs + 1):
         for x, y in zip(xs_train, ys_train):
-            out, h_pre, h = sgd_forward(x, W1, b1, W2, b2, n, hidden)
-            sgd_backward_update(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd)
+            out, h_pre, h = sgd_forward_fn(x, W1, b1, W2, b2, n, hidden)
+            updated = sgd_bwd_fn(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd)
             steps += 1
+            total_flops += flops_fwd + (flops_bwd if updated else 2)
+            total_reads += reads_fwd + (reads_bwd if updated else 2)
+
         # Test accuracy
-        outs = [sgd_forward(x, W1, b1, W2, b2, n, hidden)[0] for x in xs_test]
+        outs = [sgd_forward_fn(x, W1, b1, W2, b2, n, hidden)[0] for x in xs_test]
         correct = sum(1 for o, y in zip(outs, ys_test) if (1.0 if o >= 0 else -1.0) == y)
         acc = correct / len(ys_test)
-        best_acc = max(best_acc, acc)
+        total_flops += len(xs_test) * (flops_fwd + 1)
+        total_reads += len(xs_test) * fwd_reads_only
+
         if acc == 1.0:
-            elapsed = time.time() - t0
-            return elapsed, steps, acc, epoch
-    elapsed = time.time() - t0
-    return elapsed, steps, best_acc, max_epochs
+            return time.time() - t0, steps, acc, epoch, total_flops, total_reads
+
+    return time.time() - t0, steps, acc, max_epochs, total_flops, total_reads
 
 
 def gf2_gauss_solve(A, b_vec, n):
-    """Gaussian elimination over GF(2). Returns predicted secret indices or None."""
     m = len(A)
     row_len = n + 1
     aug = [A[i][:] + [b_vec[i]] for i in range(m)]
     pivot_row = 0
-
     for col in range(n):
         if pivot_row >= m:
             break
@@ -415,8 +397,6 @@ def gf2_gauss_solve(A, b_vec, n):
             if row != pivot_row and aug[row][col] == 1:
                 aug[row] = [aug[row][j] ^ aug[pivot_row][j] for j in range(row_len)]
         pivot_row += 1
-
-    # Extract solution
     solution = [0] * n
     for i in range(pivot_row):
         for c in range(n):
@@ -427,20 +407,28 @@ def gf2_gauss_solve(A, b_vec, n):
 
 
 def run_gf2_to_accuracy(xs_train, ys_train, xs_test, ys_test, n):
-    """Run GF(2) solve (trying both b and 1-b) and return (time, test_acc)."""
     n_samples = len(xs_train)
     A = [[int((xs_train[i][j] + 1) / 2) for j in range(n)] for i in range(n_samples)]
     b_vec = [int((ys_train[i] + 1) / 2) for i in range(n_samples)]
     b_flip = [1 - b for b in b_vec]
 
-    t0 = time.time()
+    solve_flops, solve_reads = gf2_flops_and_reads(n, n_samples)
+    # Verification on test data
+    verify_flops = len(xs_test) * n   # k multiplications per test sample
+    verify_reads = len(xs_test) * n   # read k elements per test sample
+    total_flops = solve_flops + verify_flops
+    total_reads = solve_reads + verify_reads
 
+    t0 = time.time()
     best_acc = 0.0
-    best_predicted = None
     for b_try in [b_vec, b_flip]:
         predicted = gf2_gauss_solve(A, b_try, n)
         if not predicted:
             continue
+        correct = sum(1 for x, y in zip(xs_test, ys_test)
+                      if (1.0 if all(True for _ in []) else
+                          math.prod(x[idx] for idx in predicted)) == y)
+        # simpler:
         correct = 0
         for x, y in zip(xs_test, ys_test):
             val = 1.0
@@ -451,11 +439,14 @@ def run_gf2_to_accuracy(xs_train, ys_train, xs_test, ys_test, n):
         acc = correct / len(ys_test)
         if acc > best_acc:
             best_acc = acc
-            best_predicted = predicted
 
     elapsed = time.time() - t0
-    return elapsed, best_acc
+    return elapsed, best_acc, total_flops, total_reads
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     print("╔" + "═" * 70 + "╗")
@@ -466,95 +457,91 @@ def main():
     # PART 1: REUSE DISTANCE (per-step, n=20)
     # ═══════════════════════════════════════════════════════════════════════
     print(f"\n  REUSE DISTANCE COMPARISON (n={N_BITS}, k={K_SPARSE}, hidden={HIDDEN})")
-    print(f"  MLP: {N_BITS} → {HIDDEN} → 1  ({HIDDEN * N_BITS + HIDDEN + HIDDEN + 1:,} params)")
+    print(f"  MLP: {N_BITS} → {HIDDEN} → 1  ({HIDDEN*N_BITS + HIDDEN + HIDDEN + 1:,} params)")
 
     xs, ys, secret = generate_data(N_BITS, K_SPARSE, N_TRAIN, SEED)
     print(f"  Secret: {secret}")
 
     sgd_mem = run_sgd_step(xs, ys, N_BITS, HIDDEN, LR, WD, SEED)
-    sgd = sgd_mem.report(f"SGD MLP — 1 Forward+Backward Step (n={N_BITS}, hidden={HIDDEN})")
+    sgd = sgd_mem.report(f"SGD MLP — 1 Step (n={N_BITS}, hidden={HIDDEN})")
 
     gf2_mem = run_gf2_solve(xs, ys, N_BITS, N_TRAIN)
-    gf2 = gf2_mem.report(f"GF(2) Gaussian Elimination — 1 Solve (n={N_BITS}, samples={N_TRAIN})")
+    gf2 = gf2_mem.report(f"GF(2) Gaussian Elim — 1 Solve (n={N_BITS}, samples={N_TRAIN})")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PART 2: TIME TO 100% TEST ACCURACY (n=3, where SGD converges)
+    # PART 2: TIME, FLOPs, READS TO 100% ACCURACY (n=3)
     # ═══════════════════════════════════════════════════════════════════════
     print(f"\n{'═' * 72}")
-    print(f"  TIME TO 100% TEST ACCURACY  (n={CONV_N}, k={CONV_K})")
-    print(f"  SGD: {CONV_N} → {CONV_HIDDEN} → 1  |  GF(2): {CONV_N+1} samples")
+    print(f"  TIME / FLOPs / READS TO 100% ACCURACY  (n={CONV_N}, k={CONV_K})")
+    print(f"  SGD: {CONV_N} → {CONV_HIDDEN} → 1  |  GF(2): {CONV_TRAIN} samples")
     print(f"{'═' * 72}")
 
-    xs_conv, ys_conv, secret_conv = generate_data(CONV_N, CONV_K, CONV_TRAIN, SEED)
     xs_test, ys_test, _ = generate_data(CONV_N, CONV_K, CONV_TEST, SEED + 1000)
 
-    # GF(2) — use same training data size as SGD for fairness
-    gf2_times = []
+    # GF(2) — 5 seeds
+    gf2_results = []
     for s in range(SEED, SEED + 5):
         xs_g, ys_g, _ = generate_data(CONV_N, CONV_K, CONV_TRAIN, s)
-        t, acc = run_gf2_to_accuracy(xs_g, ys_g, xs_test, ys_test, CONV_N)
-        status = f"test_acc={acc:.0%}"
-        if acc == 1.0:
-            gf2_times.append(t)
-        print(f"  GF(2) seed={s}:  {t*1e6:>8,.0f} µs  {status}")
-    gf2_avg = sum(gf2_times) / len(gf2_times) if gf2_times else float('inf')
+        t, acc, flops, reads = run_gf2_to_accuracy(xs_g, ys_g, xs_test, ys_test, CONV_N)
+        gf2_results.append((t, acc, flops, reads))
+        print(f"  GF(2) seed={s}:  {t*1e6:>8,.0f}µs  {flops:>8,} FLOPs  {reads:>8,} reads  acc={acc:.0%}")
 
-    # SGD
-    sgd_times = []
+    gf2_ok = [(t, f, r) for t, a, f, r in gf2_results if a == 1.0]
+    gf2_avg_t = sum(t for t, _, _ in gf2_ok) / len(gf2_ok) if gf2_ok else float('inf')
+    gf2_avg_f = sum(f for _, f, _ in gf2_ok) / len(gf2_ok) if gf2_ok else 0
+    gf2_avg_r = sum(r for _, _, r in gf2_ok) / len(gf2_ok) if gf2_ok else 0
+
+    # SGD — 5 seeds
+    sgd_results = []
     for s in range(SEED, SEED + 5):
         xs_s, ys_s, _ = generate_data(CONV_N, CONV_K, CONV_TRAIN, s)
-        t, steps, acc, epochs = run_sgd_to_convergence(
+        t, steps, acc, epochs, flops, reads = run_sgd_to_convergence(
             xs_s, ys_s, xs_test, ys_test, CONV_N, CONV_HIDDEN, LR, WD, s, max_epochs=50)
+        sgd_results.append((t, acc, flops, reads, steps, epochs))
         if acc == 1.0:
-            sgd_times.append(t)
-            print(f"  SGD  seed={s}:  {t*1e6:>8,.0f} µs  ({t:.3f}s)  {epochs} epochs, {steps} steps")
+            print(f"  SGD  seed={s}:  {t*1e6:>8,.0f}µs  {flops:>8,} FLOPs  {reads:>8,} reads  "
+                  f"{epochs}ep/{steps}steps")
         else:
-            print(f"  SGD  seed={s}: FAILED ({acc:.0%}) after {epochs} epochs")
-    sgd_avg = sum(sgd_times) / len(sgd_times) if sgd_times else float('inf')
+            print(f"  SGD  seed={s}:  FAILED ({acc:.0%}) after {epochs} epochs")
 
-    print(f"\n  {'Method':<12} {'Avg Time':>12}")
-    print(f"  {'─'*12} {'─'*12}")
-    print(f"  {'GF(2)':<12} {gf2_avg*1e6:>10,.0f}µs")
-    print(f"  {'SGD MLP':<12} {sgd_avg*1e6:>10,.0f}µs")
-    if gf2_avg > 0 and sgd_avg < float('inf'):
-        print(f"\n  ⚡ GF(2) is {sgd_avg/gf2_avg:,.0f}× faster to 100% accuracy")
-    print(f"{'═' * 72}")
+    sgd_ok = [(t, f, r) for t, a, f, r, _, _ in sgd_results if a == 1.0]
+    sgd_avg_t = sum(t for t, _, _ in sgd_ok) / len(sgd_ok) if sgd_ok else float('inf')
+    sgd_avg_f = sum(f for _, f, _ in sgd_ok) / len(sgd_ok) if sgd_ok else 0
+    sgd_avg_r = sum(r for _, _, r in sgd_ok) / len(sgd_ok) if sgd_ok else 0
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PART 3: SIDE-BY-SIDE SUMMARY
+    # SIDE-BY-SIDE SUMMARY
     # ═══════════════════════════════════════════════════════════════════════
     print(f"\n{'═' * 72}")
     print(f"  SIDE-BY-SIDE SUMMARY")
     print(f"{'═' * 72}")
-    print(f"  {'Metric':<40} {'SGD MLP':>12} {'GF(2)':>12}")
-    print(f"  {'─' * 40} {'─' * 12} {'─' * 12}")
+    print(f"  {'Metric':<40} {'SGD MLP':>14} {'GF(2)':>14}")
+    print(f"  {'─' * 40} {'─' * 14} {'─' * 14}")
 
-    rows = [
-        ('Avg reuse dist (weighted)',    'weighted_ard'),
-        ('Avg reuse dist (per-read)',    'per_read_ard'),
-        ('Working set (elements)',       'working_set'),
-        ('Total elements accessed',      'total_accessed'),
-    ]
-    for label, key in rows:
+    # Reuse distance (n=20)
+    for label, key in [('Weighted avg reuse distance', 'weighted_ard'),
+                       ('Working set (elements)', 'working_set')]:
         sv = sgd.get(key, 0)
         gv = gf2.get(key, 0)
-        if isinstance(sv, float):
-            print(f"  {label:<40} {sv:>12,.0f} {gv:>12,.0f}")
-        else:
-            print(f"  {label:<40} {sv:>12,} {gv:>12,}")
+        print(f"  {label:<40} {sv:>14,.0f} {gv:>14,.0f}")
 
-    conv_label = f"Time to 100% (n={CONV_N})"
-    print(f"  {conv_label:<40} {sgd_avg:>10.3f}s {gf2_avg:>8.6f}s")
+    # Convergence metrics (n=3)
+    print(f"  {'Time to 100% accuracy':<40} {sgd_avg_t:>12.3f}s {gf2_avg_t:>10.6f}s")
+    print(f"  {'Total FLOPs to 100%':<40} {sgd_avg_f:>14,.0f} {gf2_avg_f:>14,.0f}")
+    print(f"  {'Total memory reads to 100%':<40} {sgd_avg_r:>14,.0f} {gf2_avg_r:>14,.0f}")
 
     # Ratios
     ratio_ard = sgd['weighted_ard'] / gf2['weighted_ard'] if gf2['weighted_ard'] > 0 else float('inf')
-    speed_ratio = sgd_avg / gf2_avg if gf2_avg > 0 and sgd_avg < float('inf') else float('inf')
+    ratio_time = sgd_avg_t / gf2_avg_t if gf2_avg_t > 0 else float('inf')
+    ratio_flops = sgd_avg_f / gf2_avg_f if gf2_avg_f > 0 else float('inf')
+    ratio_reads = sgd_avg_r / gf2_avg_r if gf2_avg_r > 0 else float('inf')
 
-    print(f"\n      📊 GF(2) weighted ARD is {ratio_ard:.0f}× smaller (better cache locality)")
-    print(f"      📊 GF(2) is {speed_ratio:,.0f}× faster to 100% accuracy")
+    print(f"\n      📊 GF(2) weighted ARD:   {ratio_ard:.0f}× smaller")
+    print(f"      📊 GF(2) time:           {ratio_time:,.0f}× faster")
+    print(f"      📊 GF(2) FLOPs:          {ratio_flops:,.0f}× fewer")
+    print(f"      📊 GF(2) memory reads:   {ratio_reads:,.0f}× fewer")
     print(f"{'═' * 72}")
 
 
 if __name__ == "__main__":
     main()
-
