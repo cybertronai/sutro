@@ -82,9 +82,28 @@ The key optimization: update each layer's parameters **immediately** after compu
 
 Gradient buffers `dW2`, `db2` flipped from ❌ to ✅ — consumed while still in cache. For deeper networks, this compounds across more layers.
 
-## Loss & Accuracy Curves
+## SGD vs GF(2) Gaussian Elimination (2026-03-09)
 
-![Loss & Accuracy Curves](loss_plot.png)
+*Joint work with [Yad](https://github.com/0bserver07/SutroYaro)*
+
+`compare_reuse_distance.py` runs both algorithms on the same sparse parity problem and compares runtime and memory efficiency.
+
+```bash
+python3 compare_reuse_distance.py
+```
+
+### Results
+
+| Metric | SGD MLP | GF(2) Gauss Elim | Ratio |
+|---|---|---|---|
+| **Weighted avg reuse distance** | 2,584 | 75 | **34×** smaller |
+| **Time to 100% accuracy** (n=3, k=3) | 151,198 µs | 107 µs | **1,409×** faster |
+| Working set | 2,725 elements | 1,364 elements | 2× smaller |
+
+### Why GF(2) wins
+
+- **Cache locality**: GF(2) operates on a single augmented matrix. Each Gaussian elimination step touches 2 rows (~42 elements), keeping data hot in L1 cache. SGD's `W1` matrix (2,000 elements) is read during the forward pass but not re-accessed until end of backward — a reuse distance ≈ entire working set.
+- **Algorithmic fit**: Sparse parity is a linear problem over GF(2). Gaussian elimination solves it exactly in O(n²) with n+1 samples, while SGD must discover the structure through iterative gradient descent over many epochs.
 
 ## GPU Toy Problem (Modal)
 
@@ -119,4 +138,3 @@ PyTorch sees: NVIDIA L4
   Estimated cost:      $0.0030  (L4 @ $0.84/hr)
 =======================================================
 ```
-

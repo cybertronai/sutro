@@ -142,9 +142,10 @@ def generate_data(n_bits, k_sparse, n_samples, seed=42):
 # GF(2) GAUSSIAN ELIMINATION
 # =============================================================================
 
-def gf2_gauss_elim(A, b):
+def gf2_gauss_elim(A, b, tracker=None):
     """
     Solve A * s = b over GF(2) using Gaussian elimination with partial pivoting.
+    Fully instrumented for memory reuse distance tracking.
 
     A: (m x n) binary matrix (numpy uint8, values 0 or 1)
     b: (m,) binary vector
@@ -154,16 +155,32 @@ def gf2_gauss_elim(A, b):
         rank: rank of the augmented matrix
     """
     m, n = A.shape
+    row_len = n + 1  # width of augmented matrix
+
     # Build augmented matrix [A | b]
-    aug = np.zeros((m, n + 1), dtype=np.uint8)
+    if tracker:
+        tracker.read('A_gf2', m * n)
+        tracker.read('b_gf2', m)
+
+    aug = np.zeros((m, row_len), dtype=np.uint8)
     aug[:, :n] = A
     aug[:, n] = b
+
+    if tracker:
+        tracker.write('aug', m * row_len)
 
     pivot_row = 0
     pivot_cols = []
 
     for col in range(n):
-        # Find a row with a 1 in this column at or below pivot_row
+        # Pivot search: scan column from pivot_row to m
+        remaining = m - pivot_row
+        if remaining <= 0:
+            break
+
+        if tracker:
+            tracker.read('aug_col', remaining)  # read 1 element per remaining row
+
         found = -1
         for row in range(pivot_row, m):
             if aug[row, col] == 1:
@@ -173,31 +190,50 @@ def gf2_gauss_elim(A, b):
         if found == -1:
             continue  # no pivot in this column, skip
 
-        # Swap rows
+        # Row swap (if needed)
         if found != pivot_row:
+            if tracker:
+                tracker.read('aug_row', 2 * row_len)   # read both rows
             aug[[pivot_row, found]] = aug[[found, pivot_row]]
+            if tracker:
+                tracker.write('aug_row', 2 * row_len)  # write both rows
 
         pivot_cols.append(col)
 
-        # Eliminate all other rows that have a 1 in this column
+        # Eliminate: scan column, then XOR for each row with a 1
+        if tracker:
+            tracker.read('aug_col', m)  # scan column for rows to eliminate
+
         for row in range(m):
             if row != pivot_row and aug[row, col] == 1:
-                aug[row] = aug[row] ^ aug[pivot_row]  # XOR = addition mod 2
+                if tracker:
+                    tracker.read('aug_row', 2 * row_len)  # read pivot + target row
+                aug[row] = aug[row] ^ aug[pivot_row]
+                if tracker:
+                    tracker.write('aug_row', row_len)      # write modified row
 
         pivot_row += 1
 
     rank = pivot_row
 
-    # Check consistency: any row with all-zero A part but non-zero b part
+    # Consistency check: read remaining rows
+    if tracker and rank < m:
+        tracker.read('aug_row', (m - rank) * row_len)
+
     for row in range(rank, m):
         if aug[row, n] == 1:
             return None, rank  # inconsistent
 
-    # Back-substitute to get solution
-    # Free variables get 0 (we want the sparsest solution)
+    # Back-substitute: read pivot positions from aug, write solution
+    if tracker:
+        tracker.read('aug_row', rank * row_len)  # read reduced rows
+
     solution = np.zeros(n, dtype=np.uint8)
     for i, col in enumerate(pivot_cols):
         solution[col] = aug[i, n]
+
+    if tracker:
+        tracker.write('solution', n)
 
     return solution, rank
 
@@ -214,45 +250,44 @@ def gf2_solve(x, y, n_bits, tracker=None):
     """
     n_samples = x.shape[0]
 
-    # Convert to GF(2)
-    # x_bit: -1 -> 0, +1 -> 1
+    if tracker:
+        tracker.write('x_input', x.size)
+
+    # Convert to GF(2): x_bit = (x+1)/2, y_bit = (y+1)/2
+    if tracker:
+        tracker.read('x_input', x.size)
+
     A = ((x + 1) / 2).astype(np.uint8)
-    # y_bit: -1 -> 0, +1 -> 1
     b = ((y + 1) / 2).astype(np.uint8)
 
     if tracker:
-        tracker.write('x_input', x.size)
         tracker.write('A_gf2', A.size)
+        tracker.write('y_input', n_samples)
+        tracker.read('y_input', n_samples)
         tracker.write('b_gf2', n_samples)
-        tracker.read('x_input', x.size)  # read to convert
-
-    if tracker:
-        tracker.read('A_gf2', A.size)
-        tracker.read('b_gf2', n_samples)
 
     # Try both b (odd k) and 1-b (even k)
+    # Only the first attempt is tracked (the important one)
     solutions = []
-    for b_try in [b, (1 - b).astype(np.uint8)]:
-        solution, rank = gf2_gauss_elim(A.copy(), b_try.copy())
+    for i, b_try in enumerate([b, (1 - b).astype(np.uint8)]):
+        t = tracker if (i == 0 and tracker) else None
+        solution, rank = gf2_gauss_elim(A.copy(), b_try.copy(), tracker=t)
         if solution is not None:
             predicted = sorted(np.where(solution == 1)[0].tolist())
             solutions.append((predicted, solution, rank))
 
-    if tracker:
-        tracker.write('solution', n_bits)
-
     if not solutions:
         return None, None, rank
 
-    # If both solutions exist, verify which one actually produces correct labels
-    # on the training data (using the original {-1,+1} representation)
+    # Verify: which solution produces correct labels?
     for predicted, solution, rank in solutions:
         if len(predicted) > 0:
+            if tracker:
+                tracker.read('x_input', x.size)
             y_check = np.prod(x[:, predicted], axis=1)
             if np.all(y_check == y):
                 return predicted, solution, rank
 
-    # Fallback: return the first solution found
     predicted, solution, rank = solutions[0]
     return predicted, solution, rank
 
@@ -268,6 +303,7 @@ def run_config(n_bits, k_sparse, n_samples_list, seeds, verbose=True):
         print(f"\n  Config: n={n_bits}, k={k_sparse}, C(n,k)={c_n_k:,}")
 
     results = []
+    first_tracker = None
 
     for n_samples in n_samples_list:
         seed_results = []
@@ -307,6 +343,8 @@ def run_config(n_bits, k_sparse, n_samples_list, seeds, verbose=True):
 
             if tracker:
                 seed_result['tracker'] = tracker.to_json()
+                if first_tracker is None:
+                    first_tracker = tracker
 
             seed_results.append(seed_result)
 
@@ -329,9 +367,9 @@ def run_config(n_bits, k_sparse, n_samples_list, seeds, verbose=True):
             'per_seed': seed_results,
         })
 
-        # Print tracker report for first config
-        if use_tracker and tracker:
-            tracker.report()
+    # Print tracker report for first config
+    if first_tracker:
+        first_tracker.report()
 
     return {
         'n_bits': n_bits,

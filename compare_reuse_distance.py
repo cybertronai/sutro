@@ -15,13 +15,22 @@ import random
 import time
 
 # =============================================================================
-# CONFIG — same problem for both algorithms
+# CONFIG
 # =============================================================================
 
+# Reuse distance comparison (per-step)
 N_BITS   = 20       # input dimension
 K_SPARSE = 3        # parity bits
 N_TRAIN  = 21       # n+1 samples (minimum for GF(2))
 HIDDEN   = 100      # MLP hidden width
+
+# Convergence timing (must be small enough for SGD to converge in pure Python)
+CONV_N     = 3
+CONV_K     = 3
+CONV_TRAIN = 20
+CONV_TEST  = 20
+CONV_HIDDEN = 1000
+
 LR       = 0.5
 WD       = 0.01
 SEED     = 42
@@ -322,43 +331,209 @@ def run_gf2_solve(xs, ys, n, n_samples):
 # MAIN: run both and compare
 # =============================================================================
 
+def sgd_forward(x, W1, b1, W2, b2, n, hidden):
+    """Forward pass, returns (out, h_pre, h)."""
+    h_pre = [sum(W1[j][i] * x[i] for i in range(n)) + b1[j] for j in range(hidden)]
+    h = [max(0.0, hp) for hp in h_pre]
+    out = sum(W2[0][j] * h[j] for j in range(hidden)) + b2[0]
+    return out, h_pre, h
+
+
+def sgd_backward_update(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd):
+    """Backward + fused SGD update (no tracking, for convergence test)."""
+    margin = out * y
+    if margin >= 1.0:
+        return
+    dout = -y
+    dW2_0 = [dout * h[j] for j in range(hidden)]
+    db2_0 = dout
+    dh = [W2[0][j] * dout for j in range(hidden)]
+    # Update W2, b2
+    for j in range(hidden):
+        W2[0][j] -= lr * (dW2_0[j] + wd * W2[0][j])
+    b2[0] -= lr * (db2_0 + wd * b2[0])
+    # ReLU backward
+    dh_pre = [dh[j] * (1.0 if h_pre[j] > 0 else 0.0) for j in range(hidden)]
+    # Update W1, b1
+    for j in range(hidden):
+        for i in range(n):
+            W1[j][i] -= lr * (dh_pre[j] * x[i] + wd * W1[j][i])
+    for j in range(hidden):
+        b1[j] -= lr * (dh_pre[j] + wd * b1[j])
+
+
+def run_sgd_to_convergence(xs_train, ys_train, xs_test, ys_test, n, hidden, lr, wd, seed, max_epochs=50):
+    """Train SGD MLP until 100% test accuracy. Returns (time, steps, test_acc)."""
+    rng = random.Random(seed)
+    std1 = math.sqrt(2.0 / n)
+    std2 = math.sqrt(2.0 / hidden)
+    W1 = [[rng.gauss(0, std1) for _ in range(n)] for _ in range(hidden)]
+    b1 = [0.0] * hidden
+    W2 = [[rng.gauss(0, std2) for _ in range(hidden)]]
+    b2 = [0.0]
+
+    t0 = time.time()
+    steps = 0
+    best_acc = 0.0
+    for epoch in range(1, max_epochs + 1):
+        for x, y in zip(xs_train, ys_train):
+            out, h_pre, h = sgd_forward(x, W1, b1, W2, b2, n, hidden)
+            sgd_backward_update(x, y, out, h_pre, h, W1, b1, W2, b2, n, hidden, lr, wd)
+            steps += 1
+        # Test accuracy
+        outs = [sgd_forward(x, W1, b1, W2, b2, n, hidden)[0] for x in xs_test]
+        correct = sum(1 for o, y in zip(outs, ys_test) if (1.0 if o >= 0 else -1.0) == y)
+        acc = correct / len(ys_test)
+        best_acc = max(best_acc, acc)
+        if acc == 1.0:
+            elapsed = time.time() - t0
+            return elapsed, steps, acc, epoch
+    elapsed = time.time() - t0
+    return elapsed, steps, best_acc, max_epochs
+
+
+def gf2_gauss_solve(A, b_vec, n):
+    """Gaussian elimination over GF(2). Returns predicted secret indices or None."""
+    m = len(A)
+    row_len = n + 1
+    aug = [A[i][:] + [b_vec[i]] for i in range(m)]
+    pivot_row = 0
+
+    for col in range(n):
+        if pivot_row >= m:
+            break
+        found = -1
+        for row in range(pivot_row, m):
+            if aug[row][col] == 1:
+                found = row
+                break
+        if found == -1:
+            continue
+        if found != pivot_row:
+            aug[pivot_row], aug[found] = aug[found], aug[pivot_row]
+        for row in range(m):
+            if row != pivot_row and aug[row][col] == 1:
+                aug[row] = [aug[row][j] ^ aug[pivot_row][j] for j in range(row_len)]
+        pivot_row += 1
+
+    # Extract solution
+    solution = [0] * n
+    for i in range(pivot_row):
+        for c in range(n):
+            if aug[i][c] == 1:
+                solution[c] = aug[i][n]
+                break
+    return sorted([j for j in range(n) if solution[j] == 1])
+
+
+def run_gf2_to_accuracy(xs_train, ys_train, xs_test, ys_test, n):
+    """Run GF(2) solve (trying both b and 1-b) and return (time, test_acc)."""
+    n_samples = len(xs_train)
+    A = [[int((xs_train[i][j] + 1) / 2) for j in range(n)] for i in range(n_samples)]
+    b_vec = [int((ys_train[i] + 1) / 2) for i in range(n_samples)]
+    b_flip = [1 - b for b in b_vec]
+
+    t0 = time.time()
+
+    best_acc = 0.0
+    best_predicted = None
+    for b_try in [b_vec, b_flip]:
+        predicted = gf2_gauss_solve(A, b_try, n)
+        if not predicted:
+            continue
+        correct = 0
+        for x, y in zip(xs_test, ys_test):
+            val = 1.0
+            for idx in predicted:
+                val *= x[idx]
+            if val == y:
+                correct += 1
+        acc = correct / len(ys_test)
+        if acc > best_acc:
+            best_acc = acc
+            best_predicted = predicted
+
+    elapsed = time.time() - t0
+    return elapsed, best_acc
+
+
 def main():
     print("╔" + "═" * 70 + "╗")
     print("║   ENERGY EFFICIENCY COMPARISON: SGD MLP vs GF(2) Gaussian Elim     ║")
     print("╚" + "═" * 70 + "╝")
-    print(f"  Problem: n={N_BITS}, k={K_SPARSE}, samples={N_TRAIN}, seed={SEED}")
-    print(f"  MLP:     {N_BITS} → {HIDDEN} → 1  ({HIDDEN * N_BITS + HIDDEN + HIDDEN + 1:,} params)")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PART 1: REUSE DISTANCE (per-step, n=20)
+    # ═══════════════════════════════════════════════════════════════════════
+    print(f"\n  REUSE DISTANCE COMPARISON (n={N_BITS}, k={K_SPARSE}, hidden={HIDDEN})")
+    print(f"  MLP: {N_BITS} → {HIDDEN} → 1  ({HIDDEN * N_BITS + HIDDEN + HIDDEN + 1:,} params)")
 
     xs, ys, secret = generate_data(N_BITS, K_SPARSE, N_TRAIN, SEED)
-    print(f"  Secret:  {secret}")
+    print(f"  Secret: {secret}")
 
-    # ── Run SGD ──────────────────────────────────────────────────────────
-    t0 = time.time()
     sgd_mem = run_sgd_step(xs, ys, N_BITS, HIDDEN, LR, WD, SEED)
-    sgd_time = time.time() - t0
-    sgd = sgd_mem.report("SGD MLP — 1 Forward+Backward Step (fused updates)")
+    sgd = sgd_mem.report(f"SGD MLP — 1 Forward+Backward Step (n={N_BITS}, hidden={HIDDEN})")
 
-    # ── Run GF(2) ────────────────────────────────────────────────────────
-    t0 = time.time()
     gf2_mem = run_gf2_solve(xs, ys, N_BITS, N_TRAIN)
-    gf2_time = time.time() - t0
-    gf2 = gf2_mem.report("GF(2) Gaussian Elimination — 1 Solve")
+    gf2 = gf2_mem.report(f"GF(2) Gaussian Elimination — 1 Solve (n={N_BITS}, samples={N_TRAIN})")
 
-    # ── Side-by-side ─────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # PART 2: TIME TO 100% TEST ACCURACY (n=3, where SGD converges)
+    # ═══════════════════════════════════════════════════════════════════════
     print(f"\n{'═' * 72}")
-    print(f"  SIDE-BY-SIDE COMPARISON  (n={N_BITS}, k={K_SPARSE}, samples={N_TRAIN})")
+    print(f"  TIME TO 100% TEST ACCURACY  (n={CONV_N}, k={CONV_K})")
+    print(f"  SGD: {CONV_N} → {CONV_HIDDEN} → 1  |  GF(2): {CONV_N+1} samples")
+    print(f"{'═' * 72}")
+
+    xs_conv, ys_conv, secret_conv = generate_data(CONV_N, CONV_K, CONV_TRAIN, SEED)
+    xs_test, ys_test, _ = generate_data(CONV_N, CONV_K, CONV_TEST, SEED + 1000)
+
+    # GF(2) — use same training data size as SGD for fairness
+    gf2_times = []
+    for s in range(SEED, SEED + 5):
+        xs_g, ys_g, _ = generate_data(CONV_N, CONV_K, CONV_TRAIN, s)
+        t, acc = run_gf2_to_accuracy(xs_g, ys_g, xs_test, ys_test, CONV_N)
+        status = f"test_acc={acc:.0%}"
+        if acc == 1.0:
+            gf2_times.append(t)
+        print(f"  GF(2) seed={s}:  {t*1e6:>8,.0f} µs  {status}")
+    gf2_avg = sum(gf2_times) / len(gf2_times) if gf2_times else float('inf')
+
+    # SGD
+    sgd_times = []
+    for s in range(SEED, SEED + 5):
+        xs_s, ys_s, _ = generate_data(CONV_N, CONV_K, CONV_TRAIN, s)
+        t, steps, acc, epochs = run_sgd_to_convergence(
+            xs_s, ys_s, xs_test, ys_test, CONV_N, CONV_HIDDEN, LR, WD, s, max_epochs=50)
+        if acc == 1.0:
+            sgd_times.append(t)
+            print(f"  SGD  seed={s}:  {t*1e6:>8,.0f} µs  ({t:.3f}s)  {epochs} epochs, {steps} steps")
+        else:
+            print(f"  SGD  seed={s}: FAILED ({acc:.0%}) after {epochs} epochs")
+    sgd_avg = sum(sgd_times) / len(sgd_times) if sgd_times else float('inf')
+
+    print(f"\n  {'Method':<12} {'Avg Time':>12}")
+    print(f"  {'─'*12} {'─'*12}")
+    print(f"  {'GF(2)':<12} {gf2_avg*1e6:>10,.0f}µs")
+    print(f"  {'SGD MLP':<12} {sgd_avg*1e6:>10,.0f}µs")
+    if gf2_avg > 0 and sgd_avg < float('inf'):
+        print(f"\n  ⚡ GF(2) is {sgd_avg/gf2_avg:,.0f}× faster to 100% accuracy")
+    print(f"{'═' * 72}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PART 3: SIDE-BY-SIDE SUMMARY
+    # ═══════════════════════════════════════════════════════════════════════
+    print(f"\n{'═' * 72}")
+    print(f"  SIDE-BY-SIDE SUMMARY")
     print(f"{'═' * 72}")
     print(f"  {'Metric':<40} {'SGD MLP':>12} {'GF(2)':>12}")
     print(f"  {'─' * 40} {'─' * 12} {'─' * 12}")
 
     rows = [
-        ('Total elements accessed',   'total_accessed'),
-        ('Total elements read',       'total_read'),
-        ('Working set (elements)',     'working_set'),
-        ('Read operations',           'n_reads'),
-        ('Write operations',          'n_writes'),
-        ('Avg reuse dist (per-read)', 'per_read_ard'),
-        ('Avg reuse dist (weighted)', 'weighted_ard'),
+        ('Avg reuse dist (weighted)',    'weighted_ard'),
+        ('Avg reuse dist (per-read)',    'per_read_ard'),
+        ('Working set (elements)',       'working_set'),
+        ('Total elements accessed',      'total_accessed'),
     ]
     for label, key in rows:
         sv = sgd.get(key, 0)
@@ -368,29 +543,18 @@ def main():
         else:
             print(f"  {label:<40} {sv:>12,} {gv:>12,}")
 
-    print(f"  {'Wall time':<40} {sgd_time*1e6:>10,.0f}µs {gf2_time*1e6:>10,.0f}µs")
+    conv_label = f"Time to 100% (n={CONV_N})"
+    print(f"  {conv_label:<40} {sgd_avg:>10.3f}s {gf2_avg:>8.6f}s")
 
-    # ── Ratios ───────────────────────────────────────────────────────────
-    if gf2['weighted_ard'] > 0:
-        ratio_ard = sgd['weighted_ard'] / gf2['weighted_ard']
-    else:
-        ratio_ard = float('inf')
-    ratio_data = sgd['total_accessed'] / gf2['total_accessed']
+    # Ratios
+    ratio_ard = sgd['weighted_ard'] / gf2['weighted_ard'] if gf2['weighted_ard'] > 0 else float('inf')
+    speed_ratio = sgd_avg / gf2_avg if gf2_avg > 0 and sgd_avg < float('inf') else float('inf')
 
-    print(f"\n  {'':>4}📊 SGD weighted ARD is {ratio_ard:.1f}× larger (worse cache locality)")
-    print(f"  {'':>4}📊 SGD accesses {ratio_data:.1f}× more total data")
-    print(f"  {'':>4}📊 GF(2) working set is {sgd['working_set']/gf2['working_set']:.0f}× smaller")
-
-    # ── Why ──────────────────────────────────────────────────────────────
-    print(f"\n  WHY?")
-    print(f"  ─────────────────────────────────────────────────────────────")
-    print(f"  SGD: W1 ({HIDDEN*N_BITS:,} elements) is read in forward, not re-read")
-    print(f"       until end of backward → reuse dist ≈ entire working set.")
-    print(f"  GF(2): operates on single augmented matrix ({N_TRAIN}×{N_BITS+1}={N_TRAIN*(N_BITS+1)} elements).")
-    print(f"       Each step does row XOR → touches 2 rows ({2*(N_BITS+1)} elements),")
-    print(f"       keeps data hot in L1 cache the entire time.")
+    print(f"\n      📊 GF(2) weighted ARD is {ratio_ard:.0f}× smaller (better cache locality)")
+    print(f"      📊 GF(2) is {speed_ratio:,.0f}× faster to 100% accuracy")
     print(f"{'═' * 72}")
 
 
 if __name__ == "__main__":
     main()
+
