@@ -1,0 +1,62 @@
+site_name: Sutro Research
+site_description: Sutro Group - Energy-Efficient AI Training Research
+site_url: https://cybertronai.github.io/sutro/
+repo_url: https://github.com/cybertronai/sutro
+repo_name: cybertronai/sutro
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Research:
+      - Sparse Sum Survey: research/sparse-sum-survey.md
+      - Sparse Sum Findings:
+          - Standard Backprop: findings/sparse_sum_standard.md
+          - Fused Updates: findings/sparse_sum_fused.md
+          - Per-Layer: findings/sparse_sum_perlayer.md
