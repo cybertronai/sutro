@@ -33,11 +33,16 @@ theme:
 
 plugins:
   - search
+  - mermaid2
 
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.tasklist:
@@ -55,6 +60,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Research:
+      - Sparse Parity Survey: research/survey.md
       - Sparse Sum Survey: research/sparse-sum-survey.md
       - Sparse Sum Findings:
           - Standard Backprop: findings/sparse_sum_standard.md
